@@ -1,0 +1,579 @@
+diff --git a/common/gdm-settings-keys.h b/common/gdm-settings-keys.h
+index 631a30c..01fb61d 100644
+--- a/common/gdm-settings-keys.h
++++ b/common/gdm-settings-keys.h
+@@ -37,6 +37,7 @@ G_BEGIN_DECLS
+ #define GDM_KEY_WAYLAND_ENABLE "daemon/WaylandEnable"
+ #define GDM_KEY_XORG_ENABLE "daemon/XorgEnable"
+ #define GDM_KEY_REMOTE_LOGIN_ENABLE "daemon/RemoteLoginEnable"
++#define GDM_KEY_REMOTE_LOGIN_TAKEOVER "daemon/RemoteLoginTakeover"
+ 
+ #define GDM_KEY_DEBUG "debug/Enable"
+ 
+diff --git a/daemon/gdm-local-display.c b/daemon/gdm-local-display.c
+index 8d90a20..40c674b 100644
+--- a/daemon/gdm-local-display.c
++++ b/daemon/gdm-local-display.c
+@@ -41,6 +41,7 @@
+ #include "gdm-launch-environment.h"
+ #include "gdm-local-display.h"
+ #include "gdm-local-display-glue.h"
++#include "gdm-remote-display-glue.h"
+ #include "gdm-settings-direct.h"
+ #include "gdm-settings-keys.h"
+ 
+@@ -48,6 +49,10 @@ struct _GdmLocalDisplay
+ {
+         GdmDisplay           parent;
+         GdmDBusLocalDisplay *skeleton;
++
++        /* Only present once the user session on this display has been
++         * taken over by a remote client (see RemoteLoginTakeover). */
++        GdmDBusRemoteDisplay *remote_skeleton;
+ };
+ 
+ static void     gdm_local_display_class_init   (GdmLocalDisplayClass *klass);
+@@ -80,6 +85,7 @@ gdm_local_display_finalize (GObject *object)
+         GdmLocalDisplay *display = GDM_LOCAL_DISPLAY (object);
+ 
+         g_clear_object (&display->skeleton);
++        g_clear_object (&display->remote_skeleton);
+ 
+         G_OBJECT_CLASS (gdm_local_display_parent_class)->finalize (object);
+ }
+@@ -160,3 +166,42 @@ gdm_local_display_new (void)
+ 
+         return GDM_DISPLAY (object);
+ }
++
++/**
++ * gdm_local_display_set_remote_id:
++ *
++ * Exposes the org.gnome.DisplayManager.RemoteDisplay interface on a local
++ * user session display, so remoting software (gnome-remote-desktop) can hand
++ * the remote client identified by @remote_id over to the session running on
++ * this display. The interface is added with the remote id already set, which
++ * the remoting software treats like a newly created remote user display;
++ * later calls only update the remote id, which it treats as a reconnection.
++ */
++void
++gdm_local_display_set_remote_id (GdmLocalDisplay *display,
++                                 const char      *remote_id)
++{
++        g_return_if_fail (GDM_IS_LOCAL_DISPLAY (display));
++
++        if (display->remote_skeleton != NULL) {
++                g_object_set (G_OBJECT (display->remote_skeleton), "remote-id", remote_id, NULL);
++                return;
++        }
++
++        display->remote_skeleton = GDM_DBUS_REMOTE_DISPLAY (gdm_dbus_remote_display_skeleton_new ());
++        g_object_set (G_OBJECT (display->remote_skeleton), "remote-id", remote_id, NULL);
++        g_object_bind_property (display, "session-id",
++                                display->remote_skeleton, "session-id",
++                                G_BINDING_SYNC_CREATE);
++
++        g_dbus_object_skeleton_add_interface (gdm_display_get_object_skeleton (GDM_DISPLAY (display)),
++                                              G_DBUS_INTERFACE_SKELETON (display->remote_skeleton));
++}
++
++gboolean
++gdm_local_display_is_remote_attached (GdmLocalDisplay *display)
++{
++        g_return_val_if_fail (GDM_IS_LOCAL_DISPLAY (display), FALSE);
++
++        return display->remote_skeleton != NULL;
++}
+diff --git a/daemon/gdm-local-display.h b/daemon/gdm-local-display.h
+index 5bd7f92..4bbd043 100644
+--- a/daemon/gdm-local-display.h
++++ b/daemon/gdm-local-display.h
+@@ -32,6 +32,10 @@ G_DECLARE_FINAL_TYPE (GdmLocalDisplay, gdm_local_display, GDM, LOCAL_DISPLAY, Gd
+ 
+ GdmDisplay *        gdm_local_display_new                     (void);
+ 
++void                gdm_local_display_set_remote_id           (GdmLocalDisplay *display,
++                                                               const char      *remote_id);
++gboolean            gdm_local_display_is_remote_attached      (GdmLocalDisplay *display);
++
+ 
+ G_END_DECLS
+ 
+diff --git a/daemon/gdm-manager.c b/daemon/gdm-manager.c
+index 2b8309e..7c9a08f 100644
+--- a/daemon/gdm-manager.c
++++ b/daemon/gdm-manager.c
+@@ -575,6 +575,9 @@ out:
+         g_free (session_id);
+ }
+ 
++static gboolean are_sessions_compatible (GdmSession *session_a,
++                                         GdmSession *session_b);
++
+ static gboolean
+ switch_to_compatible_user_session (GdmManager *manager,
+                                    GdmSession *session,
+@@ -586,6 +589,7 @@ switch_to_compatible_user_session (GdmManager *manager,
+         const char *seat_id;
+         const char *ssid_to_activate;
+         GdmSession *existing_session;
++        GdmSession *caller_session = session;
+ 
+         ret = FALSE;
+ 
+@@ -598,6 +602,15 @@ switch_to_compatible_user_session (GdmManager *manager,
+ 
+         existing_session = find_session_for_user (manager, username, session);
+ 
++        /* Never activate or unlock a session from an incompatible login
++         * (e.g. a remote login screen must not unlock a local seat session). */
++        if (existing_session != NULL && existing_session != caller_session &&
++            !are_sessions_compatible (caller_session, existing_session)) {
++                g_debug ("GdmManager: not switching to incompatible session %s",
++                         gdm_session_get_session_id (existing_session));
++                goto out;
++        }
++
+         if (existing_session != NULL) {
+                 ssid_to_activate = gdm_session_get_session_id (existing_session);
+                 if (seat_id != NULL) {
+@@ -1156,6 +1169,43 @@ are_sessions_compatible (GdmSession *session_a,
+         return g_strcmp0 (session_a_seat_id, session_b_seat_id) == 0;
+ }
+ 
++/* RemoteLoginTakeover: a user authenticating at a remote login screen may take
++ * over their existing session on a local seat. The seat is switched to a login
++ * screen and the session is handed to the remote client; logging in locally
++ * again takes it back (the remote client is disconnected by the remoting
++ * software when the session becomes active on the seat again).
++ */
++static gboolean
++remote_login_takeover_enabled (GdmManager *manager)
++{
++        gboolean enabled = FALSE;
++
++        if (!manager->remote_login_enabled)
++                return FALSE;
++
++        gdm_settings_direct_get_boolean (GDM_KEY_REMOTE_LOGIN_TAKEOVER, &enabled);
++        return enabled;
++}
++
++static gboolean
++can_remote_take_over_session (GdmManager *manager,
++                              GdmSession *login_session,
++                              GdmSession *user_session)
++{
++        gboolean login_is_local = TRUE;
++        gboolean user_is_local = FALSE;
++
++        if (!remote_login_takeover_enabled (manager))
++                return FALSE;
++
++        g_object_get (G_OBJECT (login_session), "display-is-local", &login_is_local, NULL);
++        g_object_get (G_OBJECT (user_session), "display-is-local", &user_is_local, NULL);
++
++        return !login_is_local &&
++               user_is_local &&
++               gdm_session_get_display_seat_id (user_session) != NULL;
++}
++
+ static gboolean
+ gdm_manager_handle_open_reauthentication_channel (GdmDBusManager        *manager,
+                                                   GDBusMethodInvocation *invocation,
+@@ -1203,7 +1253,8 @@ gdm_manager_handle_open_reauthentication_channel (GdmDBusManager        *manager
+         }
+ 
+         if (session != NULL && login_session != NULL &&
+-            !are_sessions_compatible (session, login_session)) {
++            !are_sessions_compatible (session, login_session) &&
++            !can_remote_take_over_session (self, login_session, session)) {
+                 g_dbus_method_invocation_return_error_literal (invocation,
+                                                                G_DBUS_ERROR,
+                                                                G_DBUS_ERROR_ACCESS_DENIED,
+@@ -1718,6 +1769,17 @@ create_display_for_user_session (GdmManager *self,
+                       NULL);
+         gdm_display_store_add (self->display_store,
+                                display);
++
++        /* A remote login started in the background on a local seat: hand the
++         * session to the remote client right away. */
++        if (GDM_IS_LOCAL_DISPLAY (display) && gdm_session_is_background (session)) {
++                g_autofree char *remote_id = NULL;
++
++                g_object_get (G_OBJECT (session), "remote-id", &remote_id, NULL);
++                if (remote_id != NULL && remote_id[0] != '\0')
++                        gdm_local_display_set_remote_id (GDM_LOCAL_DISPLAY (display), remote_id);
++        }
++
+         g_object_set_data (G_OBJECT (session), "gdm-display", display);
+         g_object_set_data_full (G_OBJECT (display),
+                                 "gdm-user-session",
+@@ -1987,6 +2049,37 @@ on_session_authentication_failed (GdmSession *session,
+         add_session_record (manager, session, conversation_pid, SESSION_RECORD_FAILED);
+ }
+ 
++/* With RemoteLoginTakeover, a remote login of a user without a session starts
++ * that session in the background on seat0 (instead of headless and seat-less),
++ * already handed over to the remote client. It is then an ordinary local
++ * session that can be taken back and forth between the seat and remote
++ * clients like one started locally. */
++static void
++maybe_start_session_in_background (GdmManager *manager,
++                                   GdmSession *session)
++{
++        gboolean is_local = TRUE;
++        const char *username;
++
++        if (!remote_login_takeover_enabled (manager))
++                return;
++
++        g_object_get (G_OBJECT (session), "display-is-local", &is_local, NULL);
++        if (is_local || gdm_session_get_display_seat_id (session) != NULL)
++                return;
++
++        if (sd_seat_can_graphical ("seat0") <= 0 || sd_seat_can_tty ("seat0") <= 0) {
++                g_debug ("GdmManager: no graphical seat0 with VTs; starting remote session headless");
++                return;
++        }
++
++        username = gdm_session_get_username (session);
++        if (username == NULL || find_session_for_user (manager, username, session) != NULL)
++                return;
++
++        gdm_session_start_in_background_on_seat (session, "seat0");
++}
++
+ static void
+ on_session_credentials_established (GdmSession *session,
+                                     const char *service_name,
+@@ -2001,6 +2094,8 @@ on_session_credentials_established (GdmSession *session,
+                 return;
+         }
+ 
++        maybe_start_session_in_background (manager, session);
++
+         /* If this is the initial setup, chown the g-i-s homedir now before the
+          * PAM session is opened and the consumers are started.
+          */
+@@ -2133,6 +2228,105 @@ lookup_by_reauth_pid (const char *id,
+         return looking_for == current;
+ }
+ 
++typedef struct {
++        GdmManager *manager;
++        GdmDisplay *user_display;
++        char       *session_id;
++        char       *remote_id;
++        guint       attempts;
++} RemoteTakeoverOperation;
++
++static void
++remote_takeover_operation_free (RemoteTakeoverOperation *operation)
++{
++        g_object_unref (operation->manager);
++        g_object_unref (operation->user_display);
++        g_free (operation->session_id);
++        g_free (operation->remote_id);
++        g_free (operation);
++}
++
++#define REMOTE_TAKEOVER_POLL_INTERVAL_MS 100
++#define REMOTE_TAKEOVER_MAX_ATTEMPTS 150
++
++static gboolean
++complete_remote_takeover (gpointer user_data)
++{
++        RemoteTakeoverOperation *operation = user_data;
++
++        /* Only hand the session to the remote client once it has left the
++         * physical seat, so nothing it shows reaches the local outputs and the
++         * compositor has released the local input devices. */
++        if (sd_session_is_active (operation->session_id) > 0) {
++                if (++operation->attempts < REMOTE_TAKEOVER_MAX_ATTEMPTS)
++                        return G_SOURCE_CONTINUE;
++
++                g_warning ("GdmManager: session %s did not leave its seat; "
++                           "not handing it over to remote client %s",
++                           operation->session_id, operation->remote_id);
++                remote_takeover_operation_free (operation);
++                return G_SOURCE_REMOVE;
++        }
++
++        g_debug ("GdmManager: handing session %s over to remote client %s",
++                 operation->session_id, operation->remote_id);
++
++        /* The remote user just authenticated as the session owner; don't make
++         * them unlock the session's own lock screen again. */
++        session_unlock (operation->manager, operation->session_id);
++
++        gdm_local_display_set_remote_id (GDM_LOCAL_DISPLAY (operation->user_display),
++                                         operation->remote_id);
++
++        remote_takeover_operation_free (operation);
++        return G_SOURCE_REMOVE;
++}
++
++static gboolean
++start_remote_takeover (GdmManager *manager,
++                       GdmSession *user_session,
++                       GdmDisplay *login_display,
++                       GdmDisplay *user_display)
++{
++        RemoteTakeoverOperation *operation;
++        const char *session_id = gdm_session_get_session_id (user_session);
++        const char *seat_id = gdm_session_get_display_seat_id (user_session);
++        g_autofree char *greeter_session_id = NULL;
++        g_autoptr (GError) error = NULL;
++
++        g_debug ("GdmManager: remote login taking over session %s on %s",
++                 session_id, seat_id);
++
++        /* Put the seat on a login screen; the user session keeps running. */
++        if (gdm_get_login_window_session_id (seat_id, &greeter_session_id) &&
++            greeter_session_id != NULL) {
++                if (!gdm_activate_session_by_id (manager->connection, NULL,
++                                                 seat_id, greeter_session_id)) {
++                        g_warning ("GdmManager: failed to activate login screen on %s", seat_id);
++                        return FALSE;
++                }
++        } else {
++                g_autofree char *display_id = NULL;
++
++                if (!gdm_local_display_factory_create_transient_display (manager->local_factory,
++                                                                         &display_id,
++                                                                         &error)) {
++                        g_warning ("GdmManager: failed to start login screen on %s: %s",
++                                   seat_id, error->message);
++                        return FALSE;
++                }
++        }
++
++        operation = g_new0 (RemoteTakeoverOperation, 1);
++        operation->manager = g_object_ref (manager);
++        operation->user_display = g_object_ref (user_display);
++        operation->session_id = g_strdup (session_id);
++        operation->remote_id = gdm_remote_display_get_remote_id (GDM_REMOTE_DISPLAY (login_display));
++
++        g_timeout_add (REMOTE_TAKEOVER_POLL_INTERVAL_MS, complete_remote_takeover, operation);
++        return TRUE;
++}
++
+ static void
+ on_session_reauthenticated (GdmSession *session,
+                             const char *service_name,
+@@ -2154,7 +2348,14 @@ on_session_reauthenticated (GdmSession *session,
+                                                                lookup_by_session_id,
+                                                                (gpointer) session_id);
+ 
+-                        if (user_display != NULL && GDM_IS_REMOTE_DISPLAY (user_display)) {
++                        if (user_display != NULL && GDM_IS_LOCAL_DISPLAY (user_display) &&
++                            remote_login_takeover_enabled (manager)) {
++                                /* The remoting software closes the remote
++                                 * login screen once the client has been
++                                 * redirected, as in the remote case below. */
++                                start_remote_takeover (manager, session, login_display, user_display);
++                                return;
++                        } else if (user_display != NULL && GDM_IS_REMOTE_DISPLAY (user_display)) {
+                                 /* Transferring the remote id from the new login screen display to the
+                                  * preexisting user session display, notifies the remoting software to redirect
+                                  * the connection. That same software will also ensure after the redirection has
+diff --git a/daemon/gdm-remote-display-factory.c b/daemon/gdm-remote-display-factory.c
+index 0e47e96..65799ae 100644
+--- a/daemon/gdm-remote-display-factory.c
++++ b/daemon/gdm-remote-display-factory.c
+@@ -252,7 +252,9 @@ on_display_added (GdmDisplayStore         *store,
+ {
+         GdmDisplay *display = gdm_display_store_lookup (store, id);
+ 
+-        g_return_if_fail (GDM_IS_REMOTE_DISPLAY (display));
++        /* The store holds local displays too; only remote ones count. */
++        if (!GDM_IS_REMOTE_DISPLAY (display))
++                return;
+ 
+         factory->remote_displays_count++;
+ 
+@@ -278,7 +280,8 @@ on_display_removed (GdmDisplayStore         *display_store,
+ {
+         g_assert (factory->remote_displays_count >= 0);
+ 
+-        g_return_if_fail (GDM_IS_REMOTE_DISPLAY (display));
++        if (!GDM_IS_REMOTE_DISPLAY (display))
++                return;
+ 
+         factory->remote_displays_count--;
+ 
+diff --git a/daemon/gdm-session-worker.c b/daemon/gdm-session-worker.c
+index 25760b5..937c004 100644
+--- a/daemon/gdm-session-worker.c
++++ b/daemon/gdm-session-worker.c
+@@ -2590,6 +2590,30 @@ gdm_session_worker_handle_set_session_display_mode (GdmDBusWorker         *objec
+         return TRUE;
+ }
+ 
++/* Open the session on a local seat instead of the (remote) display the
++ * conversation was set up for; see gdm_session_start_in_background_on_seat(). */
++static gboolean
++gdm_session_worker_handle_set_session_seat (GdmDBusWorker         *object,
++                                            GDBusMethodInvocation *invocation,
++                                            const char            *seat_id)
++{
++        GdmSessionWorker *worker = GDM_SESSION_WORKER (object);
++
++        g_debug ("GdmSessionWorker: session will be opened on seat %s", seat_id);
++
++        g_free (worker->display_seat_id);
++        worker->display_seat_id = g_strdup (seat_id);
++        worker->display_is_local = TRUE;
++
++        if (worker->pam_handle != NULL)
++                pam_set_item (worker->pam_handle, PAM_RHOST, NULL);
++
++        gdm_session_worker_set_environment_variable (worker, "XDG_SEAT", seat_id);
++
++        gdm_dbus_worker_complete_set_session_seat (object, invocation);
++        return TRUE;
++}
++
+ static gboolean
+ gdm_session_worker_handle_set_language_name (GdmDBusWorker         *object,
+                                              GDBusMethodInvocation *invocation,
+@@ -3522,6 +3546,7 @@ worker_interface_init (GdmDBusWorkerIface *interface)
+         interface->handle_set_language_name = gdm_session_worker_handle_set_language_name;
+         interface->handle_set_session_name = gdm_session_worker_handle_set_session_name;
+         interface->handle_set_session_display_mode = gdm_session_worker_handle_set_session_display_mode;
++        interface->handle_set_session_seat = gdm_session_worker_handle_set_session_seat;
+         interface->handle_set_environment_variable = gdm_session_worker_handle_set_environment_variable;
+         interface->handle_start_program = gdm_session_worker_handle_start_program;
+         interface->handle_start_reauthentication = gdm_session_worker_handle_start_reauthentication;
+diff --git a/daemon/gdm-session-worker.xml b/daemon/gdm-session-worker.xml
+index 214ca8d..b5ffbd0 100644
+--- a/daemon/gdm-session-worker.xml
++++ b/daemon/gdm-session-worker.xml
+@@ -16,6 +16,9 @@
+     <method name="SetSessionDisplayMode">
+       <arg name="mode" direction="in" type="s"/>
+     </method>
++    <method name="SetSessionSeat">
++      <arg name="seat_id" direction="in" type="s"/>
++    </method>
+     <method name="SetEnvironmentVariable">
+       <arg name="name" direction="in" type="s"/>
+       <arg name="value" direction="in" type="s"/>
+diff --git a/daemon/gdm-session.c b/daemon/gdm-session.c
+index f8495c8..e84a152 100644
+--- a/daemon/gdm-session.c
++++ b/daemon/gdm-session.c
+@@ -127,6 +127,10 @@ struct _GdmSession
+         char                *display_x11_authority_file;
+         gboolean             display_is_local;
+ 
++        /* Set when a login from a remote display is started as a local
++         * session on this seat instead, without activating it there. */
++        char                *background_seat_id;
++
+         GdmSessionVerificationMode verification_mode;
+ 
+         uid_t                allowed_user;
+@@ -3001,6 +3005,11 @@ gdm_session_open_session (GdmSession *self,
+         conversation = find_conversation_by_name (self, service_name);
+ 
+         if (conversation != NULL) {
++                if (self->background_seat_id != NULL)
++                        gdm_dbus_worker_call_set_session_seat (conversation->worker_proxy,
++                                                               self->background_seat_id,
++                                                               conversation->worker_cancellable,
++                                                               NULL, NULL);
+                 send_display_mode (self, conversation);
+                 send_session_type (self, conversation);
+ 
+@@ -3475,6 +3484,39 @@ gdm_session_get_display_device (GdmSession *self)
+         return self->display_device;
+ }
+ 
++/**
++ * gdm_session_start_in_background_on_seat:
++ *
++ * Makes the session about to be opened by this (remote) login a local
++ * session on @seat_id, on a VT of its own that is not switched to. From then
++ * on the session behaves like any other local session on that seat, so it can
++ * be brought to the seat later by logging in there. Must be called before the
++ * session is opened.
++ */
++void
++gdm_session_start_in_background_on_seat (GdmSession *self,
++                                         const char *seat_id)
++{
++        g_return_if_fail (GDM_IS_SESSION (self));
++
++        g_debug ("GdmSession: starting session in the background on %s", seat_id);
++
++        g_free (self->background_seat_id);
++        self->background_seat_id = g_strdup (seat_id);
++
++        g_free (self->display_seat_id);
++        self->display_seat_id = g_strdup (seat_id);
++        self->display_is_local = TRUE;
++}
++
++gboolean
++gdm_session_is_background (GdmSession *self)
++{
++        g_return_val_if_fail (GDM_IS_SESSION (self), FALSE);
++
++        return self->background_seat_id != NULL;
++}
++
+ const char *
+ gdm_session_get_display_seat_id (GdmSession *self)
+ {
+@@ -3651,6 +3693,11 @@ gdm_session_get_display_mode (GdmSession *self)
+ {
+         g_return_val_if_fail (GDM_IS_SESSION (self), GDM_SESSION_DISPLAY_MODE_NEW_VT);
+ 
++        /* Background sessions get a VT of their own, but GDM must not jump to
++         * it: the seat keeps showing whatever it shows now. */
++        if (self->background_seat_id != NULL)
++                return GDM_SESSION_DISPLAY_MODE_LOGIND_MANAGED;
++
+         g_debug ("GdmSession: type %s, program? %s, seat %s",
+                  self->session_type,
+                  self->is_program_session? "yes" : "no",
+@@ -3999,6 +4046,7 @@ gdm_session_dispose (GObject *object)
+         self->display_device = NULL;
+ 
+         g_free (self->display_seat_id);
++        g_clear_pointer (&self->background_seat_id, g_free);
+         self->display_seat_id = NULL;
+ 
+         g_free (self->display_x11_authority_file);
+diff --git a/daemon/gdm-session.h b/daemon/gdm-session.h
+index a20a2c6..17f59b7 100644
+--- a/daemon/gdm-session.h
++++ b/daemon/gdm-session.h
+@@ -75,6 +75,9 @@ const char       *gdm_session_get_server_address          (GdmSession     *sessi
+ const char       *gdm_session_get_username                (GdmSession     *session);
+ const char       *gdm_session_get_display_device          (GdmSession     *session);
+ const char       *gdm_session_get_display_seat_id         (GdmSession     *session);
++void              gdm_session_start_in_background_on_seat (GdmSession     *session,
++                                                           const char     *seat_id);
++gboolean          gdm_session_is_background               (GdmSession     *session);
+ const char       *gdm_session_get_session_id              (GdmSession     *session);
+ gboolean          gdm_session_bypasses_xsession           (GdmSession     *session);
+ gboolean          gdm_session_session_registers           (GdmSession     *session);
+diff --git a/data/gdm.schemas.in b/data/gdm.schemas.in
+index 621bfca..29ebbb3 100644
+--- a/data/gdm.schemas.in
++++ b/data/gdm.schemas.in
+@@ -72,6 +72,11 @@
+       <signature>b</signature>
+       <default>true</default>
+     </schema>
++    <schema>
++      <key>daemon/RemoteLoginTakeover</key>
++      <signature>b</signature>
++      <default>false</default>
++    </schema>
+     <schema>
+       <key>security/AllowRemoteAutoLogin</key>
+       <signature>b</signature>

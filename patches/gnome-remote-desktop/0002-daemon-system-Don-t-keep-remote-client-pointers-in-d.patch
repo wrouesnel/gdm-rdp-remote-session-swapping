@@ -1,0 +1,257 @@
+From e4239d04613da6ed39fae316ca5b00005ca9dd98 Mon Sep 17 00:00:00 2001
+From: will <wrouesnel@wrouesnel.com>
+Date: Tue, 29 Sep 2026 17:26:04 +1000
+Subject: [PATCH 2/2] daemon-system: Don't keep remote client pointers in
+ display handlers
+
+The notify::remote-id and notify::session-id handlers on GDM remote displays
+were connected with a GrdRemoteClient pointer as user data, but remote clients
+are freed independently, e.g. by abort_handover() when a client goes away
+during a handover (fails to reconnect after redirection). The next remote id
+change on that display (a new remote logon taking over the same session) then
+used the freed client and crashed the system daemon (SIGSEGV), dropping the new
+client.
+
+Connect the handlers with the daemon instead and remember a display's current
+client by id (object data on the display proxy), looking it up in the remote
+client table when needed; a vanished previous client is simply skipped.
+---
+ src/grd-daemon-system.c | 159 ++++++++++++++++++++++++----------------
+ 1 file changed, 95 insertions(+), 64 deletions(-)
+
+diff --git a/src/grd-daemon-system.c b/src/grd-daemon-system.c
+index 83cf7f4..9e7c296 100644
+--- a/src/grd-daemon-system.c
++++ b/src/grd-daemon-system.c
+@@ -874,14 +874,61 @@ on_remote_display_factory_proxy_acquired (GObject      *object,
+   grd_daemon_maybe_enable_services (GRD_DAEMON (daemon_system));
+ }
+ 
++/*
++ * The remote client a GDM remote display currently belongs to is remembered by
++ * id (object data on the display proxy) rather than by pointer: remote clients
++ * can be freed at any time (e.g. when a handover is aborted because the client
++ * went away), and the display's signal handlers must not outlive them.
++ */
++#define REMOTE_DISPLAY_CLIENT_ID_KEY "grd-remote-client-id"
++
++static void register_handover_for_display (GrdDaemonSystem         *daemon_system,
++                                           GrdDBusGdmRemoteDisplay *remote_display);
++
++static GrdRemoteClient *
++lookup_remote_client (GrdDaemonSystem *daemon_system,
++                      const char      *remote_id)
++{
++  GrdRemoteClient *remote_client = NULL;
++
++  if (!remote_id)
++    return NULL;
++
++  if (!g_hash_table_lookup_extended (daemon_system->remote_clients,
++                                     remote_id, NULL,
++                                     (gpointer *) &remote_client))
++    return NULL;
++
++  return remote_client;
++}
++
+ static void
+ on_gdm_remote_display_session_id_changed (GrdDBusGdmRemoteDisplay *remote_display,
+                                           GParamSpec              *pspec,
+-                                          GrdRemoteClient         *remote_client)
++                                          GrdDaemonSystem         *daemon_system)
+ {
++  GrdRemoteClient *remote_client;
+   const char *session_id;
+ 
+   session_id = grd_dbus_gdm_remote_display_get_session_id (remote_display);
++  if (!session_id || strcmp (session_id, "") == 0)
++    return;
++
++  g_signal_handlers_disconnect_by_func (
++    remote_display,
++    G_CALLBACK (on_gdm_remote_display_session_id_changed),
++    daemon_system);
++
++  remote_client =
++    lookup_remote_client (daemon_system,
++                          g_object_get_data (G_OBJECT (remote_display),
++                                             REMOTE_DISPLAY_CLIENT_ID_KEY));
++  if (!remote_client)
++    {
++      g_debug ("[DaemonSystem] Remote client of display with session %s is "
++               "gone", session_id);
++      return;
++    }
+ 
+   g_debug ("[DaemonSystem] GDM added a new remote display with remote id: %s "
+            "and session: %s",
+@@ -889,84 +936,65 @@ on_gdm_remote_display_session_id_changed (GrdDBusGdmRemoteDisplay *remote_displa
+            session_id);
+ 
+   register_handover_iface (remote_client, session_id);
+-
+-  g_signal_handlers_disconnect_by_func (
+-    remote_display,
+-    G_CALLBACK (on_gdm_remote_display_session_id_changed),
+-    remote_client);
+ }
+ 
+ static void
+ on_remote_display_remote_id_changed (GrdDBusGdmRemoteDisplay *remote_display,
+                                      GParamSpec              *pspec,
+-                                     GrdRemoteClient         *remote_client)
++                                     GrdDaemonSystem         *daemon_system)
+ {
+-  GrdDaemonSystem *daemon_system = remote_client->daemon_system;
+   GrdRemoteClient *new_remote_client;
++  g_autofree char *old_remote_id = NULL;
+   const char *remote_id;
+   const char *session_id;
+ 
+   remote_id = grd_dbus_gdm_remote_display_get_remote_id (remote_display);
+-  if (!g_hash_table_lookup_extended (daemon_system->remote_clients,
+-                                     remote_id, NULL,
+-                                     (gpointer *) &new_remote_client))
++  new_remote_client = lookup_remote_client (daemon_system, remote_id);
++  if (!new_remote_client)
+     {
+       g_debug ("[DaemonSystem] GDM set to a remote display a remote "
+                "id %s we didn't know about", remote_id);
+       return;
+     }
+ 
++  old_remote_id = g_strdup (g_object_get_data (G_OBJECT (remote_display),
++                                               REMOTE_DISPLAY_CLIENT_ID_KEY));
++  if (g_strcmp0 (old_remote_id, remote_id) == 0)
++    return;
++
++  session_id = grd_dbus_gdm_remote_display_get_session_id (remote_display);
++
++  if (!old_remote_id)
++    {
++      /* Registered before its remote id was known to us (e.g. after a
++       * daemon restart); a session that already runs a handover daemon (e.g.
++       * a local session taken over by a remote client) needs to be told to
++       * start over. */
++      register_handover_for_display (daemon_system, remote_display);
++      if (new_remote_client->handover_dst)
++        {
++          grd_dbus_remote_desktop_rdp_handover_emit_restart_handover (
++            new_remote_client->handover_dst->interface);
++        }
++      return;
++    }
++
+   g_debug ("[DaemonSystem] GDM updated a remote display with a new remote id: "
+            "%s", remote_id);
+ 
+-  g_signal_handlers_disconnect_by_func (remote_display,
+-                                        G_CALLBACK (on_remote_display_remote_id_changed),
+-                                        remote_client);
+-  g_signal_connect (remote_display, "notify::remote-id",
+-                    G_CALLBACK (on_remote_display_remote_id_changed),
+-                    new_remote_client);
++  g_object_set_data_full (G_OBJECT (remote_display),
++                          REMOTE_DISPLAY_CLIENT_ID_KEY,
++                          g_strdup (remote_id), g_free);
+ 
+-  g_hash_table_remove (daemon_system->remote_clients, remote_client->id);
++  /* The previous client may already be gone (aborted handover). */
++  g_hash_table_remove (daemon_system->remote_clients, old_remote_id);
+ 
+-  session_id = grd_dbus_gdm_remote_display_get_session_id (remote_display);
+   register_handover_iface (new_remote_client, session_id);
+ 
+   grd_dbus_remote_desktop_rdp_handover_emit_restart_handover (
+     new_remote_client->handover_dst->interface);
+ }
+ 
+-static void register_handover_for_display (GrdDaemonSystem         *daemon_system,
+-                                           GrdDBusGdmRemoteDisplay *remote_display);
+-
+-static void
+-on_unclaimed_remote_display_remote_id_changed (GrdDBusGdmRemoteDisplay *remote_display,
+-                                               GParamSpec              *pspec,
+-                                               GrdDaemonSystem         *daemon_system)
+-{
+-  GrdRemoteClient *remote_client;
+-  const char *remote_id;
+-
+-  remote_id = grd_dbus_gdm_remote_display_get_remote_id (remote_display);
+-  if (!g_hash_table_lookup_extended (daemon_system->remote_clients,
+-                                     remote_id, NULL,
+-                                     (gpointer *) &remote_client))
+-    return;
+-
+-  g_signal_handlers_disconnect_by_func (remote_display,
+-                                        G_CALLBACK (on_unclaimed_remote_display_remote_id_changed),
+-                                        daemon_system);
+-
+-  register_handover_for_display (daemon_system, remote_display);
+-
+-  /* A session that already runs a handover daemon (e.g. a local session
+-   * taken over by a remote client) needs to be told to start over. */
+-  if (remote_client->handover_dst)
+-    {
+-      grd_dbus_remote_desktop_rdp_handover_emit_restart_handover (
+-        remote_client->handover_dst->interface);
+-    }
+-}
+-
+ static void
+ register_handover_for_display (GrdDaemonSystem         *daemon_system,
+                                GrdDBusGdmRemoteDisplay *remote_display)
+@@ -975,33 +1003,36 @@ register_handover_for_display (GrdDaemonSystem         *daemon_system,
+   const char *session_id;
+   const char *remote_id;
+ 
++  g_signal_handlers_disconnect_by_func (remote_display,
++                                        G_CALLBACK (on_remote_display_remote_id_changed),
++                                        daemon_system);
++  g_signal_connect (remote_display, "notify::remote-id",
++                    G_CALLBACK (on_remote_display_remote_id_changed),
++                    daemon_system);
++
+   remote_id = grd_dbus_gdm_remote_display_get_remote_id (remote_display);
+-  if (!g_hash_table_lookup_extended (daemon_system->remote_clients,
+-                                     remote_id, NULL,
+-                                     (gpointer *) &remote_client))
++  remote_client = lookup_remote_client (daemon_system, remote_id);
++  if (!remote_client)
+     {
+       g_debug ("[DaemonSystem] GDM added a new remote display with a remote "
+                "id %s we didn't know about", remote_id);
+-      g_signal_handlers_disconnect_by_func (remote_display,
+-                                            G_CALLBACK (on_unclaimed_remote_display_remote_id_changed),
+-                                            daemon_system);
+-      g_signal_connect (remote_display, "notify::remote-id",
+-                        G_CALLBACK (on_unclaimed_remote_display_remote_id_changed),
+-                        daemon_system);
+       return;
+     }
+ 
+-  g_signal_connect (remote_display, "notify::remote-id",
+-                    G_CALLBACK (on_remote_display_remote_id_changed),
+-                    remote_client);
++  g_object_set_data_full (G_OBJECT (remote_display),
++                          REMOTE_DISPLAY_CLIENT_ID_KEY,
++                          g_strdup (remote_id), g_free);
+ 
+   session_id = grd_dbus_gdm_remote_display_get_session_id (remote_display);
+   if (!session_id || strcmp (session_id, "") == 0)
+     {
++      g_signal_handlers_disconnect_by_func (remote_display,
++                                            G_CALLBACK (on_gdm_remote_display_session_id_changed),
++                                            daemon_system);
+       g_signal_connect (G_OBJECT (remote_display),
+                         "notify::session-id",
+                         G_CALLBACK (on_gdm_remote_display_session_id_changed),
+-                        remote_client);
++                        daemon_system);
+       return;
+     }
+ 
+-- 
+2.43.0
+

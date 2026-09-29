@@ -1,0 +1,9 @@
+#!/bin/bash
+# Start an RDP client on the client VM (Xvfb :77) against the target's system
+# gnome-remote-desktop, and log in at the remote GDM login screen.
+# Usage: test/remote-logon <client-ip> <target-ip> <user> <password> <gw-user> <gw-pass> [extra xfreerdp3 args...]
+CIP=$1; TIP=$2; U=$3; PW=$4; GWU=$5; GWP=$6; shift 6
+ssh -o BatchMode=yes "$U@$CIP" "pkill -u \$USER -x xfreerdp3; pkill -u \$USER -x Xvfb; sleep 1
+  (Xvfb :77 -screen 0 1600x900x24 >/dev/null 2>&1 &); sleep 1
+  (DISPLAY=:77 setsid xfreerdp3 /v:$TIP /u:$GWU /p:'$GWP' /cert:ignore /size:1600x900 /log-level:INFO $* </dev/null >/tmp/gremote.log 2>&1 &)
+  sleep 15; export DISPLAY=:77; xdotool key Return; sleep 2; xdotool type --delay 60 '$PW'; xdotool key Return"

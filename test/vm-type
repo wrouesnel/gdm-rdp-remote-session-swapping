@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Type text on the VM's physical keyboard via `virsh send-key`. Usage: vm-type DOMAIN TEXT [--enter]"""
+import subprocess, sys, time
+dom, text = sys.argv[1], sys.argv[2]
+special = {' ': 'KEY_SPACE', '.': 'KEY_DOT', '-': 'KEY_MINUS', '/': 'KEY_SLASH', '_': ('KEY_LEFTSHIFT', 'KEY_MINUS'),
+           '\t': 'KEY_TAB', '\n': 'KEY_ENTER', '@': ('KEY_LEFTSHIFT', 'KEY_2'), '!': ('KEY_LEFTSHIFT', 'KEY_1')}
+def keys(c):
+    if c in special:
+        k = special[c]; return list(k) if isinstance(k, tuple) else [k]
+    if c.isdigit(): return [f'KEY_{c}']
+    if c.isalpha(): return (['KEY_LEFTSHIFT'] if c.isupper() else []) + [f'KEY_{c.upper()}']
+    raise SystemExit(f'unsupported char {c!r}')
+seq = list(text) + (['\n'] if '--enter' in sys.argv[3:] else [])
+for c in seq:
+    subprocess.run(['virsh', 'send-key', dom, '--holdtime', '30', *keys(c)], check=True, stdout=subprocess.DEVNULL)
+    time.sleep(0.05)

@@ -1,0 +1,4 @@
+# Unpacked upstream sources (each has its own git history; changes live in patches/)
+/upstream/
+# Test run output
+/shots/

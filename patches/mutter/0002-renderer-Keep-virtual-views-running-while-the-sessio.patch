@@ -1,0 +1,101 @@
+From 19ca2cb44339c1a03ca73c57ceac8cc0676e5455 Mon Sep 17 00:00:00 2001
+From: will <wrouesnel@wrouesnel.com>
+Date: Tue, 29 Sep 2026 12:23:18 +1000
+Subject: [PATCH 2/4] renderer: Keep virtual views running while the session is
+ paused
+
+Virtual monitor views (screen cast / remote desktop) render offscreen and don't
+need the session to own the display hardware. Only inhibit frame clocks of
+views backed by physical CRTCs when the session goes inactive on its seat, so a
+remote desktop client can keep driving the session while the seat shows
+something else (e.g. a login screen).
+---
+ src/backends/meta-renderer.c | 42 +++++++++++++++++++++++++++++++-----
+ 1 file changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/src/backends/meta-renderer.c b/src/backends/meta-renderer.c
+index 1a7a40b..cc5462e 100644
+--- a/src/backends/meta-renderer.c
++++ b/src/backends/meta-renderer.c
+@@ -46,6 +46,11 @@
+ 
+ #include "backends/meta-backend-private.h"
+ #include "backends/meta-logical-monitor.h"
++#include "backends/meta-renderer-view.h"
++
++#ifdef HAVE_NATIVE_BACKEND
++#include "backends/native/meta-crtc-virtual.h"
++#endif
+ 
+ enum
+ {
+@@ -91,6 +96,27 @@ meta_renderer_create_cogl_renderer (MetaRenderer *renderer)
+   return META_RENDERER_GET_CLASS (renderer)->create_cogl_renderer (renderer);
+ }
+ 
++/*
++ * Views backed by a virtual CRTC (e.g. screen cast / remote desktop virtual
++ * monitors) render offscreen and don't need the session to own the display
++ * hardware, so they keep running while the session is paused (inactive on its
++ * seat). This lets a remote desktop client keep driving the session while the
++ * physical seat shows something else. The CRTC of a view never changes, so the
++ * same predicate keeps inhibit/uninhibit balanced across pause and resume.
++ */
++static gboolean
++view_pauses_with_session (MetaRendererView *view)
++{
++#ifdef HAVE_NATIVE_BACKEND
++  MetaCrtc *crtc = meta_renderer_view_get_crtc (view);
++
++  if (crtc && META_IS_CRTC_VIRTUAL (crtc))
++    return FALSE;
++#endif
++
++  return TRUE;
++}
++
+ static MetaRendererView *
+ meta_renderer_create_view (MetaRenderer        *renderer,
+                            MetaLogicalMonitor  *logical_monitor,
+@@ -262,7 +288,7 @@ meta_renderer_add_view (MetaRenderer     *renderer,
+ 
+   priv->views = g_list_append (priv->views, view);
+ 
+-  if (priv->is_paused)
++  if (priv->is_paused && view_pauses_with_session (view))
+     {
+       ClutterFrameClock *frame_clock =
+         clutter_stage_view_get_frame_clock (CLUTTER_STAGE_VIEW (view));
+@@ -301,9 +327,12 @@ meta_renderer_pause (MetaRenderer *renderer)
+   for (l = priv->views; l; l = l->next)
+     {
+       ClutterStageView *stage_view = l->data;
+-      ClutterFrameClock *frame_clock =
+-        clutter_stage_view_get_frame_clock (stage_view);
++      ClutterFrameClock *frame_clock;
+ 
++      if (!view_pauses_with_session (META_RENDERER_VIEW (stage_view)))
++        continue;
++
++      frame_clock = clutter_stage_view_get_frame_clock (stage_view);
+       clutter_frame_clock_inhibit (frame_clock);
+     }
+ }
+@@ -321,9 +350,12 @@ meta_renderer_resume (MetaRenderer *renderer)
+   for (l = priv->views; l; l = l->next)
+     {
+       ClutterStageView *stage_view = l->data;
+-      ClutterFrameClock *frame_clock =
+-        clutter_stage_view_get_frame_clock (stage_view);
++      ClutterFrameClock *frame_clock;
++
++      if (!view_pauses_with_session (META_RENDERER_VIEW (stage_view)))
++        continue;
+ 
++      frame_clock = clutter_stage_view_get_frame_clock (stage_view);
+       clutter_frame_clock_uninhibit (frame_clock);
+     }
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,504 @@
+From a64ae8d5a2318ab0698f2b2f30c5ef4213f0a409 Mon Sep 17 00:00:00 2001
+From: will <wrouesnel@wrouesnel.com>
+Date: Tue, 29 Sep 2026 12:23:18 +1000
+Subject: [PATCH 1/2] Support remote clients taking over local seat sessions
+
+- handover: in a local seat session, wait for a handover object to appear
+  instead of giving up when none exists yet; disconnect the remote client
+  (ERRINFO_LOGOFF_BY_USER) when the session becomes active on its seat again;
+  refuse clients while it is active; hold a logind sleep/idle inhibitor while a
+  client is attached; never log a local session out when the system daemon
+  goes away.
+- system: follow RemoteId changes on displays whose initial remote id was
+  unknown and restart the handover for them.
+- system: fix a double unref of the RedirectClient signal parameters.
+- session-rdp: add GRD_SESSION_RDP_ERROR_LOGOFF_BY_USER.
+---
+ src/grd-daemon-handover.c | 236 ++++++++++++++++++++++++++++++++++++++
+ src/grd-daemon-system.c   |  48 +++++++-
+ src/grd-daemon-utils.c    |  26 +++++
+ src/grd-daemon-utils.h    |   2 +
+ src/grd-session-rdp.c     |   3 +
+ src/grd-session-rdp.h     |   1 +
+ 6 files changed, 312 insertions(+), 4 deletions(-)
+
+diff --git a/src/grd-daemon-handover.c b/src/grd-daemon-handover.c
+index e80b1a5..80fc4bf 100644
+--- a/src/grd-daemon-handover.c
++++ b/src/grd-daemon-handover.c
+@@ -26,6 +26,8 @@
+ 
+ #include <gio/gunixfdlist.h>
+ #include <glib/gi18n.h>
++#include <glib-unix.h>
++#include <systemd/sd-login.h>
+ #include <unistd.h>
+ 
+ #include "grd-context.h"
+@@ -52,10 +54,74 @@ struct _GrdDaemonHandover
+   GCancellable *prompt_cancellable;
+ 
+   unsigned int gnome_remote_desktop_watch_name_id;
++
++  /* Set when running in a local seat session that a remote client can take
++   * over (see GDM's RemoteLoginTakeover). */
++  char *local_session_id;
++  gboolean local_session_active;
++  sd_login_monitor *login_monitor;
++  unsigned int login_monitor_source_id;
++  unsigned int handovers_added_subscription_id;
++  GDBusConnection *handovers_connection;
++
++  /* logind sleep/idle inhibitor held while a remote client drives the local
++   * session: the seat sits idle on a login screen meanwhile. */
++  int sleep_inhibitor_fd;
+ };
+ 
+ G_DEFINE_TYPE (GrdDaemonHandover, grd_daemon_handover, GRD_TYPE_DAEMON)
+ 
++static void watch_for_handover (GrdDaemonHandover *daemon_handover);
++static void stop_watching_for_handover (GrdDaemonHandover *daemon_handover);
++
++static void
++inhibit_sleep (GrdDaemonHandover *daemon_handover)
++{
++  g_autoptr (GDBusConnection) connection = NULL;
++  g_autoptr (GUnixFDList) fd_list = NULL;
++  g_autoptr (GVariant) reply = NULL;
++  g_autoptr (GError) error = NULL;
++  int fd_index;
++
++  if (daemon_handover->sleep_inhibitor_fd >= 0)
++    return;
++
++  connection = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, &error);
++  if (connection)
++    {
++      reply = g_dbus_connection_call_with_unix_fd_list_sync (
++        connection,
++        "org.freedesktop.login1",
++        "/org/freedesktop/login1",
++        "org.freedesktop.login1.Manager",
++        "Inhibit",
++        g_variant_new ("(ssss)", "sleep:idle", "GNOME Remote Desktop",
++                       "A remote client is using the session", "block"),
++        G_VARIANT_TYPE ("(h)"),
++        G_DBUS_CALL_FLAGS_NONE,
++        -1, NULL, &fd_list, NULL, &error);
++    }
++
++  if (!reply)
++    {
++      g_warning ("[DaemonHandover] Failed to inhibit sleep: %s", error->message);
++      return;
++    }
++
++  g_variant_get (reply, "(h)", &fd_index);
++  daemon_handover->sleep_inhibitor_fd = g_unix_fd_list_get (fd_list, fd_index, NULL);
++}
++
++static void
++uninhibit_sleep (GrdDaemonHandover *daemon_handover)
++{
++  if (daemon_handover->sleep_inhibitor_fd < 0)
++    return;
++
++  close (daemon_handover->sleep_inhibitor_fd);
++  daemon_handover->sleep_inhibitor_fd = -1;
++}
++
+ static gboolean
+ grd_daemon_handover_is_ready (GrdDaemon *daemon)
+ {
+@@ -265,6 +331,8 @@ on_session_stopped (GrdSession        *session,
+ 
+   daemon_handover->session = NULL;
+ 
++  uninhibit_sleep (daemon_handover);
++
+   if (daemon_handover->prompt_cancellable)
+     {
+       g_cancellable_cancel (daemon_handover->prompt_cancellable);
+@@ -361,6 +429,19 @@ on_incoming_new_connection (GrdRdpServer      *rdp_server,
+ 
+   daemon_handover->session = session;
+ 
++  if (daemon_handover->local_session_id &&
++      daemon_handover->local_session_active)
++    {
++      g_message ("[DaemonHandover] Local session %s is active on its seat, "
++                 "refusing remote client", daemon_handover->local_session_id);
++      grd_session_rdp_notify_error (GRD_SESSION_RDP (session),
++                                    GRD_SESSION_RDP_ERROR_LOGOFF_BY_USER);
++      return;
++    }
++
++  if (daemon_handover->local_session_id)
++    inhibit_sleep (daemon_handover);
++
+   grd_settings_recreate_rdp_credentials (settings);
+ 
+   if (daemon_handover->use_system_credentials && grd_is_remote_login ())
+@@ -478,6 +559,8 @@ on_remote_desktop_rdp_handover_proxy_acquired (GObject      *object,
+ 
+   daemon_handover->remote_desktop_handover = g_steal_pointer (&proxy);
+ 
++  stop_watching_for_handover (daemon_handover);
++
+   g_signal_connect (daemon_handover->remote_desktop_handover, "redirect-client",
+                     G_CALLBACK (on_redirect_client), daemon_handover);
+   g_signal_connect (daemon_handover->remote_desktop_handover, "restart-handover",
+@@ -486,6 +569,19 @@ on_remote_desktop_rdp_handover_proxy_acquired (GObject      *object,
+   grd_daemon_maybe_enable_services (GRD_DAEMON (daemon_handover));
+ }
+ 
++static void
++stop_watching_for_handover (GrdDaemonHandover *daemon_handover)
++{
++  if (daemon_handover->handovers_added_subscription_id)
++    {
++      g_dbus_connection_signal_unsubscribe (
++        daemon_handover->handovers_connection,
++        daemon_handover->handovers_added_subscription_id);
++      daemon_handover->handovers_added_subscription_id = 0;
++    }
++  g_clear_object (&daemon_handover->handovers_connection);
++}
++
+ static void
+ on_remote_desktop_rdp_dispatcher_handover_requested (GObject      *object,
+                                                      GAsyncResult *result,
+@@ -506,6 +602,15 @@ on_remote_desktop_rdp_dispatcher_handover_requested (GObject      *object,
+       &error);
+   if (!success)
+     {
++      if (daemon_handover->local_session_id)
++        {
++          g_debug ("[DaemonHandover] No handover for local session %s yet, "
++                   "waiting for a remote takeover: %s",
++                   daemon_handover->local_session_id, error->message);
++          watch_for_handover (daemon_handover);
++          return;
++        }
++
+       g_warning ("[DaemonHandover] Failed to request remote desktop "
+                  "handover: %s", error->message);
+       return;
+@@ -524,6 +629,118 @@ on_remote_desktop_rdp_dispatcher_handover_requested (GObject      *object,
+     daemon_handover);
+ }
+ 
++static void
++on_handover_interfaces_added (GDBusConnection *connection,
++                              const char      *sender_name,
++                              const char      *object_path,
++                              const char      *interface_name,
++                              const char      *signal_name,
++                              GVariant        *parameters,
++                              gpointer         user_data)
++{
++  GrdDaemonHandover *daemon_handover = user_data;
++  GCancellable *cancellable =
++    grd_daemon_get_cancellable (GRD_DAEMON (daemon_handover));
++
++  if (daemon_handover->remote_desktop_handover ||
++      !daemon_handover->remote_desktop_dispatcher)
++    return;
++
++  /* The system daemon only lets us request the handover object that belongs
++   * to our session, so simply try again whenever a new one appears. */
++  grd_dbus_remote_desktop_rdp_dispatcher_call_request_handover (
++    daemon_handover->remote_desktop_dispatcher,
++    cancellable,
++    on_remote_desktop_rdp_dispatcher_handover_requested,
++    daemon_handover);
++}
++
++static void
++watch_for_handover (GrdDaemonHandover *daemon_handover)
++{
++  GDBusConnection *connection;
++
++  if (daemon_handover->handovers_added_subscription_id)
++    return;
++
++  connection = g_dbus_proxy_get_connection (
++                 G_DBUS_PROXY (daemon_handover->remote_desktop_dispatcher));
++  daemon_handover->handovers_connection = g_object_ref (connection);
++
++  daemon_handover->handovers_added_subscription_id =
++    g_dbus_connection_signal_subscribe (connection,
++                                        REMOTE_DESKTOP_BUS_NAME,
++                                        "org.freedesktop.DBus.ObjectManager",
++                                        "InterfacesAdded",
++                                        REMOTE_DESKTOP_HANDOVERS_OBJECT_PATH,
++                                        NULL,
++                                        G_DBUS_SIGNAL_FLAGS_NONE,
++                                        on_handover_interfaces_added,
++                                        daemon_handover, NULL);
++}
++
++static gboolean
++on_login_monitor_event (int           fd,
++                        GIOCondition  condition,
++                        gpointer      user_data)
++{
++  GrdDaemonHandover *daemon_handover = user_data;
++  gboolean active;
++
++  sd_login_monitor_flush (daemon_handover->login_monitor);
++
++  active = sd_session_is_active (daemon_handover->local_session_id) > 0;
++  if (active == daemon_handover->local_session_active)
++    return G_SOURCE_CONTINUE;
++
++  daemon_handover->local_session_active = active;
++  g_debug ("[DaemonHandover] Local session %s is now %s",
++           daemon_handover->local_session_id, active ? "active" : "inactive");
++
++  /* The console user took the session back: disconnect the remote client. */
++  if (active && daemon_handover->session)
++    {
++      g_message ("[DaemonHandover] Local session %s reclaimed on its seat, "
++                 "disconnecting remote client",
++                 daemon_handover->local_session_id);
++      grd_session_rdp_notify_error (GRD_SESSION_RDP (daemon_handover->session),
++                                    GRD_SESSION_RDP_ERROR_LOGOFF_BY_USER);
++    }
++
++  return G_SOURCE_CONTINUE;
++}
++
++static void
++maybe_watch_local_session (GrdDaemonHandover *daemon_handover)
++{
++  int ret;
++
++  daemon_handover->local_session_id = grd_get_local_seat_session_id ();
++  if (!daemon_handover->local_session_id)
++    return;
++
++  daemon_handover->local_session_active =
++    sd_session_is_active (daemon_handover->local_session_id) > 0;
++
++  ret = sd_login_monitor_new ("session", &daemon_handover->login_monitor);
++  if (ret < 0)
++    {
++      g_warning ("[DaemonHandover] Failed to monitor logind sessions: %s",
++                 g_strerror (-ret));
++      return;
++    }
++
++  daemon_handover->login_monitor_source_id =
++    g_unix_fd_add (sd_login_monitor_get_fd (daemon_handover->login_monitor),
++                   G_IO_IN,
++                   on_login_monitor_event,
++                   daemon_handover);
++
++  g_message ("[DaemonHandover] Running in local session %s; remote clients "
++             "can take it over while it is inactive on its seat",
++             daemon_handover->local_session_id);
++}
++
+ static void
+ on_remote_desktop_rdp_dispatcher_proxy_acquired (GObject      *object,
+                                                  GAsyncResult *result,
+@@ -583,6 +800,16 @@ on_gnome_remote_desktop_name_vanished (GDBusConnection *connection,
+ {
+   GrdDaemonHandover *daemon_handover = user_data;
+ 
++  if (daemon_handover->local_session_id)
++    {
++      g_warning ("[DaemonHandover] %s name vanished, disconnecting any remote "
++                 "client of local session %s",
++                 REMOTE_DESKTOP_BUS_NAME, daemon_handover->local_session_id);
++      if (daemon_handover->session)
++        grd_session_stop (daemon_handover->session);
++      return;
++    }
++
+   g_warning ("[DaemonHandover] %s name vanished, shutting down daemon",
+              REMOTE_DESKTOP_BUS_NAME);
+ 
+@@ -610,6 +837,7 @@ grd_daemon_handover_new (GError **error)
+ static void
+ grd_daemon_handover_init (GrdDaemonHandover *daemon_handover)
+ {
++  daemon_handover->sleep_inhibitor_fd = -1;
+ }
+ 
+ static void
+@@ -617,6 +845,8 @@ grd_daemon_handover_startup (GApplication *app)
+ {
+   GrdDaemonHandover *daemon_handover = GRD_DAEMON_HANDOVER (app);
+ 
++  maybe_watch_local_session (daemon_handover);
++
+   grd_daemon_acquire_mutter_dbus_proxies (GRD_DAEMON (daemon_handover));
+ 
+   g_signal_connect (daemon_handover, "mutter-proxy-acquired",
+@@ -650,6 +880,12 @@ grd_daemon_handover_shutdown (GApplication *app)
+   g_clear_handle_id (&daemon_handover->gnome_remote_desktop_watch_name_id,
+                      g_bus_unwatch_name);
+ 
++  stop_watching_for_handover (daemon_handover);
++  uninhibit_sleep (daemon_handover);
++  g_clear_handle_id (&daemon_handover->login_monitor_source_id, g_source_remove);
++  g_clear_pointer (&daemon_handover->login_monitor, sd_login_monitor_unref);
++  g_clear_pointer (&daemon_handover->local_session_id, g_free);
++
+   if (daemon_handover->prompt_cancellable)
+     {
+       g_cancellable_cancel (daemon_handover->prompt_cancellable);
+diff --git a/src/grd-daemon-system.c b/src/grd-daemon-system.c
+index 3d3ab65..83cf7f4 100644
+--- a/src/grd-daemon-system.c
++++ b/src/grd-daemon-system.c
+@@ -363,10 +363,12 @@ on_handle_start_handover (GrdDBusRemoteDesktopRdpHandover *interface,
+       connection = g_dbus_interface_skeleton_get_connection (
+                      G_DBUS_INTERFACE_SKELETON (
+                      remote_client->handover_src->interface));
+-      redirect_variant = g_variant_new ("(sss)",
+-                                        routing_token,
+-                                        username,
+-                                        password);
++      /* emit_signal() consumes a floating reference; keep our own so the
++       * g_autoptr() doesn't drop a reference we don't own. */
++      redirect_variant = g_variant_ref_sink (g_variant_new ("(sss)",
++                                                            routing_token,
++                                                            username,
++                                                            password));
+       g_dbus_connection_emit_signal (connection,
+                                      remote_client->handover_src->sender_name,
+                                      remote_client->handover_src->object_path,
+@@ -933,6 +935,38 @@ on_remote_display_remote_id_changed (GrdDBusGdmRemoteDisplay *remote_display,
+     new_remote_client->handover_dst->interface);
+ }
+ 
++static void register_handover_for_display (GrdDaemonSystem         *daemon_system,
++                                           GrdDBusGdmRemoteDisplay *remote_display);
++
++static void
++on_unclaimed_remote_display_remote_id_changed (GrdDBusGdmRemoteDisplay *remote_display,
++                                               GParamSpec              *pspec,
++                                               GrdDaemonSystem         *daemon_system)
++{
++  GrdRemoteClient *remote_client;
++  const char *remote_id;
++
++  remote_id = grd_dbus_gdm_remote_display_get_remote_id (remote_display);
++  if (!g_hash_table_lookup_extended (daemon_system->remote_clients,
++                                     remote_id, NULL,
++                                     (gpointer *) &remote_client))
++    return;
++
++  g_signal_handlers_disconnect_by_func (remote_display,
++                                        G_CALLBACK (on_unclaimed_remote_display_remote_id_changed),
++                                        daemon_system);
++
++  register_handover_for_display (daemon_system, remote_display);
++
++  /* A session that already runs a handover daemon (e.g. a local session
++   * taken over by a remote client) needs to be told to start over. */
++  if (remote_client->handover_dst)
++    {
++      grd_dbus_remote_desktop_rdp_handover_emit_restart_handover (
++        remote_client->handover_dst->interface);
++    }
++}
++
+ static void
+ register_handover_for_display (GrdDaemonSystem         *daemon_system,
+                                GrdDBusGdmRemoteDisplay *remote_display)
+@@ -948,6 +982,12 @@ register_handover_for_display (GrdDaemonSystem         *daemon_system,
+     {
+       g_debug ("[DaemonSystem] GDM added a new remote display with a remote "
+                "id %s we didn't know about", remote_id);
++      g_signal_handlers_disconnect_by_func (remote_display,
++                                            G_CALLBACK (on_unclaimed_remote_display_remote_id_changed),
++                                            daemon_system);
++      g_signal_connect (remote_display, "notify::remote-id",
++                        G_CALLBACK (on_unclaimed_remote_display_remote_id_changed),
++                        daemon_system);
+       return;
+     }
+ 
+diff --git a/src/grd-daemon-utils.c b/src/grd-daemon-utils.c
+index 87c95cd..976f1b8 100644
+--- a/src/grd-daemon-utils.c
++++ b/src/grd-daemon-utils.c
+@@ -203,6 +203,32 @@ grd_is_remote_login (void)
+          sd_session_is_remote (session_id) == 1;
+ }
+ 
++/*
++ * Returns the id of the session this process belongs to if it is a local
++ * session on a seat (i.e. a physical console session), otherwise NULL.
++ */
++char *
++grd_get_local_seat_session_id (void)
++{
++  g_autofree char *session_id = NULL;
++  g_autofree char *seat = NULL;
++
++  session_id = grd_get_session_id_from_pid (getpid ());
++  if (!session_id)
++    session_id = grd_get_session_id_from_uid (getuid ());
++
++  if (!session_id)
++    return NULL;
++
++  if (sd_session_get_seat (session_id, &seat) < 0 || !seat)
++    return NULL;
++
++  if (sd_session_is_remote (session_id) > 0)
++    return NULL;
++
++  return g_steal_pointer (&session_id);
++}
++
+ void
+ grd_session_manager_call_logout_sync (void)
+ {
+diff --git a/src/grd-daemon-utils.h b/src/grd-daemon-utils.h
+index 9786f0e..dcd57ec 100644
+--- a/src/grd-daemon-utils.h
++++ b/src/grd-daemon-utils.h
+@@ -40,6 +40,8 @@ char *grd_get_session_id_from_uid (uid_t uid);
+ 
+ gboolean grd_is_remote_login (void);
+ 
++char *grd_get_local_seat_session_id (void);
++
+ void grd_session_manager_call_logout_sync (void);
+ 
+ #endif /* GRD_DAEMON_UTILS_H */
+diff --git a/src/grd-session-rdp.c b/src/grd-session-rdp.c
+index ecac9e0..db55fbe 100644
+--- a/src/grd-session-rdp.c
++++ b/src/grd-session-rdp.c
+@@ -491,6 +491,9 @@ grd_session_rdp_notify_error (GrdSessionRdp      *session_rdp,
+     case GRD_SESSION_RDP_ERROR_SERVER_REDIRECTION:
+       session_rdp->rdp_error_info = ERRINFO_CB_CONNECTION_CANCELLED;
+       break;
++    case GRD_SESSION_RDP_ERROR_LOGOFF_BY_USER:
++      session_rdp->rdp_error_info = ERRINFO_LOGOFF_BY_USER;
++      break;
+     }
+ 
+   unset_rdp_peer_flag (session_rdp, RDP_PEER_ACTIVATED);
+diff --git a/src/grd-session-rdp.h b/src/grd-session-rdp.h
+index 8fb2b0b..dbef2de 100644
+--- a/src/grd-session-rdp.h
++++ b/src/grd-session-rdp.h
+@@ -40,6 +40,7 @@ typedef enum _GrdSessionRdpError
+   GRD_SESSION_RDP_ERROR_CLOSE_STACK_ON_DRIVER_FAILURE,
+   GRD_SESSION_RDP_ERROR_GRAPHICS_SUBSYSTEM_FAILED,
+   GRD_SESSION_RDP_ERROR_SERVER_REDIRECTION,
++  GRD_SESSION_RDP_ERROR_LOGOFF_BY_USER,
+ } GrdSessionRdpError;
+ 
+ typedef enum _GrdRdpChannel
+-- 
+2.43.0
+

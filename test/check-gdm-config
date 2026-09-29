@@ -1,0 +1,13 @@
+#!/bin/bash
+# Precondition for the GNOME handoff tests: RemoteLoginTakeover must be enabled
+# in /etc/gdm3/custom.conf AND the running GDM must have loaded that file (GDM
+# reads it only at startup; editing it without restarting GDM has no effect).
+# Usage: test/check-gdm-config <user> <target-ip>
+U=$1; TIP=$2
+ssh -o BatchMode=yes "$U@$TIP" '
+  set -e
+  grep -Eq "^RemoteLoginTakeover *= *true" /etc/gdm3/custom.conf || { echo "RemoteLoginTakeover is not true in /etc/gdm3/custom.conf"; exit 1; }
+  conf=$(stat -c %Y /etc/gdm3/custom.conf)
+  gdm=$(date -d "$(systemctl show gdm -p ActiveEnterTimestamp --value)" +%s)
+  [ "$conf" -le "$gdm" ] || { echo "custom.conf changed after GDM started; restart gdm (or reboot) first"; exit 1; }
+' || exit 1

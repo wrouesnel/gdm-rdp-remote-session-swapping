@@ -1,0 +1,137 @@
+From 49b7c6e08b4ec4fdd39a2fcc51f6c8211674c4c0 Mon Sep 17 00:00:00 2001
+From: will <wrouesnel@wrouesnel.com>
+Date: Tue, 29 Sep 2026 12:23:18 +1000
+Subject: [PATCH 3/4] monitor-manager: Hide physical monitors while paused with
+ virtual ones
+
+When the native backend pauses (session inactive on its seat) and virtual
+monitors exist, leave physical outputs out of the monitor layout so the virtual
+monitors make up the whole desktop. Physical outputs return with the full
+reload done on resume.
+---
+ src/backends/meta-monitor-manager-private.h   |  5 +++
+ src/backends/meta-monitor-manager.c           | 40 ++++++++++++++++++-
+ .../native/meta-monitor-manager-native.c      | 13 ++++++
+ 3 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/src/backends/meta-monitor-manager-private.h b/src/backends/meta-monitor-manager-private.h
+index bda134a..438ab4a 100644
+--- a/src/backends/meta-monitor-manager-private.h
++++ b/src/backends/meta-monitor-manager-private.h
+@@ -352,6 +352,11 @@ void               meta_monitor_manager_reconfigure (MetaMonitorManager *manager
+ META_EXPORT_TEST
+ void               meta_monitor_manager_reload (MetaMonitorManager *manager);
+ 
++void               meta_monitor_manager_set_hide_physical_monitors (MetaMonitorManager *manager,
++                                                                    gboolean            hide);
++
++gboolean           meta_monitor_manager_is_hiding_physical_monitors (MetaMonitorManager *manager);
++
+ gboolean           meta_monitor_manager_get_monitor_matrix (MetaMonitorManager *manager,
+                                                             MetaMonitor        *monitor,
+                                                             MetaLogicalMonitor *logical_monitor,
+diff --git a/src/backends/meta-monitor-manager.c b/src/backends/meta-monitor-manager.c
+index 1abda28..c8a5938 100644
+--- a/src/backends/meta-monitor-manager.c
++++ b/src/backends/meta-monitor-manager.c
+@@ -121,6 +121,8 @@ typedef struct _MetaMonitorManagerPrivate
+   char *experimental_hdr;
+ 
+   guint reload_monitor_manager_id;
++
++  gboolean hide_physical_monitors;
+   guint switch_config_handle_id;
+ } MetaMonitorManagerPrivate;
+ 
+@@ -3908,6 +3910,8 @@ destroy_monitor (MetaMonitor *monitor)
+ static void
+ rebuild_monitors (MetaMonitorManager *manager)
+ {
++  MetaMonitorManagerPrivate *priv =
++    meta_monitor_manager_get_instance_private (manager);
+   GList *gpus;
+   GList *l;
+   gboolean has_tiling;
+@@ -3921,7 +3925,14 @@ rebuild_monitors (MetaMonitorManager *manager)
+       manager->monitors = NULL;
+     }
+ 
+-  gpus = meta_backend_get_gpus (manager->backend);
++  /* While the session is inactive on its seat but being driven through virtual
++   * monitors (remote desktop), leave the physical outputs out of the layout so
++   * the virtual monitors make up the whole desktop. */
++  if (priv->hide_physical_monitors && priv->virtual_monitors)
++    gpus = NULL;
++  else
++    gpus = meta_backend_get_gpus (manager->backend);
++
+   for (l = gpus; l; l = l->next)
+     {
+       MetaGpu *gpu = l->data;
+@@ -4194,6 +4205,33 @@ meta_monitor_manager_reconfigure (MetaMonitorManager *manager)
+   meta_monitor_manager_ensure_configured (manager);
+ }
+ 
++/**
++ * meta_monitor_manager_set_hide_physical_monitors:
++ * @manager: a #MetaMonitorManager
++ * @hide: whether physical monitors should be left out of the layout
++ *
++ * While @hide is set and at least one virtual monitor exists, only virtual
++ * monitors are part of the monitor layout. Takes effect on the next reload.
++ */
++void
++meta_monitor_manager_set_hide_physical_monitors (MetaMonitorManager *manager,
++                                                 gboolean            hide)
++{
++  MetaMonitorManagerPrivate *priv =
++    meta_monitor_manager_get_instance_private (manager);
++
++  priv->hide_physical_monitors = hide;
++}
++
++gboolean
++meta_monitor_manager_is_hiding_physical_monitors (MetaMonitorManager *manager)
++{
++  MetaMonitorManagerPrivate *priv =
++    meta_monitor_manager_get_instance_private (manager);
++
++  return priv->hide_physical_monitors && priv->virtual_monitors;
++}
++
+ void
+ meta_monitor_manager_reload (MetaMonitorManager *manager)
+ {
+diff --git a/src/backends/native/meta-monitor-manager-native.c b/src/backends/native/meta-monitor-manager-native.c
+index 5a6ab61..3392cd6 100644
+--- a/src/backends/native/meta-monitor-manager-native.c
++++ b/src/backends/native/meta-monitor-manager-native.c
+@@ -406,12 +406,25 @@ meta_monitor_manager_native_disconnect_hotplug_handler (MetaMonitorManagerNative
+ void
+ meta_monitor_manager_native_pause (MetaMonitorManagerNative *manager_native)
+ {
++  MetaMonitorManager *manager = META_MONITOR_MANAGER (manager_native);
++
+   meta_monitor_manager_native_disconnect_hotplug_handler (manager_native);
++
++  /* The session no longer owns the physical outputs; if it is being driven
++   * through virtual monitors, make those the whole desktop. */
++  meta_monitor_manager_set_hide_physical_monitors (manager, TRUE);
++  if (meta_monitor_manager_is_hiding_physical_monitors (manager))
++    meta_monitor_manager_reload (manager);
+ }
+ 
+ void
+ meta_monitor_manager_native_resume (MetaMonitorManagerNative *manager_native)
+ {
++  MetaMonitorManager *manager = META_MONITOR_MANAGER (manager_native);
++
++  /* Physical outputs come back with the full reload triggered by
++   * meta_kms_resume() via the hotplug handler connected here. */
++  meta_monitor_manager_set_hide_physical_monitors (manager, FALSE);
+   meta_monitor_manager_native_connect_hotplug_handler (manager_native);
+ }
+ 
+-- 
+2.43.0
+

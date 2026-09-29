@@ -1,0 +1,67 @@
+From fe749b4ac3c2cb985abc7e03ee921b33ac81461a Mon Sep 17 00:00:00 2001
+From: will <wrouesnel@wrouesnel.com>
+Date: Tue, 29 Sep 2026 12:57:04 +1000
+Subject: [PATCH 4/4] launcher: Sync the session's real active state after
+ startup
+
+MetaLauncher assumed the session is active when mutter starts and only reacted
+to later changes of the logind Active property. A session started in the
+background (inactive on its seat, e.g. for a remote client) was therefore never
+paused, and never resumed when later activated, leaving it with revoked input
+devices. Sync the actual state once the native backend is fully set up.
+---
+ src/backends/native/meta-backend-native.c |  3 +++
+ src/backends/native/meta-launcher.c       | 12 ++++++++++++
+ src/backends/native/meta-launcher.h       |  2 ++
+ 3 files changed, 17 insertions(+)
+
+diff --git a/src/backends/native/meta-backend-native.c b/src/backends/native/meta-backend-native.c
+index 7a8b89d..5f455af 100644
+--- a/src/backends/native/meta-backend-native.c
++++ b/src/backends/native/meta-backend-native.c
+@@ -184,6 +184,9 @@ meta_backend_native_post_init (MetaBackend *backend)
+                    g_hash_table_unref);
+ 
+   update_viewports (backend);
++
++  if (backend_native->launcher)
++    meta_launcher_sync_initial_active (backend_native->launcher);
+ }
+ 
+ static MetaBackendCapabilities
+diff --git a/src/backends/native/meta-launcher.c b/src/backends/native/meta-launcher.c
+index f638c29..7f8e611 100644
+--- a/src/backends/native/meta-launcher.c
++++ b/src/backends/native/meta-launcher.c
+@@ -326,6 +326,18 @@ sync_active (MetaLauncher *self)
+     meta_backend_native_pause (backend_native);
+ }
+ 
++/*
++ * The launcher starts out assuming the session is active. A session can also be
++ * started while inactive on its seat (e.g. in the background for a remote
++ * client); sync the real state once the backend is fully set up, so the backend
++ * is paused now and resumed properly when the session is activated later.
++ */
++void
++meta_launcher_sync_initial_active (MetaLauncher *launcher)
++{
++  sync_active (launcher);
++}
++
+ static void
+ on_active_changed (MetaDBusLogin1Session *session,
+                    GParamSpec            *pspec,
+diff --git a/src/backends/native/meta-launcher.h b/src/backends/native/meta-launcher.h
+index 3bf1c8a..715a0c6 100644
+--- a/src/backends/native/meta-launcher.h
++++ b/src/backends/native/meta-launcher.h
+@@ -39,3 +39,5 @@ const char *      meta_launcher_get_seat_id             (MetaLauncher *launcher)
+ MetaDBusLogin1Session * meta_launcher_get_session_proxy (MetaLauncher *launcher);
+ 
+ MetaBackend * meta_launcher_get_backend (MetaLauncher *launcher);
++
++void meta_launcher_sync_initial_active (MetaLauncher *launcher);
+-- 
+2.43.0
+

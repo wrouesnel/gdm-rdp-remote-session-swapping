@@ -1,0 +1,35 @@
+From e208350e06ae2f361b26f6fa9743bbde22253d97 Mon Sep 17 00:00:00 2001
+From: will <wrouesnel@wrouesnel.com>
+Date: Tue, 29 Sep 2026 12:23:18 +1000
+Subject: [PATCH 1/4] eis: Don't close the libeis-owned fd
+
+meta_event_source_free() closed the fd returned by eis_get_fd(), which libeis
+owns and closes again in eis_unref(). The second close can hit an unrelated fd
+reused by another thread in between, e.g. libudev on the input thread while
+libinput re-adds devices on session resume, which then aborts gnome-shell in
+systemd's safe_close() assertion.
+---
+ src/backends/meta-eis.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/backends/meta-eis.c b/src/backends/meta-eis.c
+index f8d9f27..36f67b2 100644
+--- a/src/backends/meta-eis.c
++++ b/src/backends/meta-eis.c
+@@ -162,9 +162,10 @@ meta_event_source_free (MetaEventSource *source)
+ {
+   GSource *g_source = (GSource *) source;
+ 
+-  /* ignore the return value of close, it's not like we can do something
+-   * about it */
+-  close (source->event_poll_fd.fd);
++  /* The fd comes from eis_get_fd() and is owned (and closed) by libeis;
++   * closing it here as well is a double close that can hit an unrelated fd
++   * reused by another thread in between (e.g. libudev on the input thread
++   * while devices are re-added on session resume). */
+ 
+   g_source_destroy (g_source);
+   g_source_unref (g_source);
+-- 
+2.43.0
+
